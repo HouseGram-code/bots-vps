@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  vps-bot:
+    build: .
+    container_name: vps-telegram-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      # Allow bot to manage sibling Docker containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persist database
+      - ./data:/app/data
+    working_dir: /app
