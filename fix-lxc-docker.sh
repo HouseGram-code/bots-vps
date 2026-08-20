@@ -29,9 +29,10 @@ restart_docker() {
     systemctl is-active docker >/dev/null 2>&1 || {
         err "демон не стартовал:"
         # "copy stream failed / closed fifo" — шум от завершённых контейнеров, не причина
-        journalctl -u docker --no-pager 2>/dev/null \
-            | grep -iE "level=(error|fatal)" \
-            | grep -viE "copy stream|closed fifo" | tail -5
+        # только СВЕЖИЕ записи — старые ошибки overlay2 вводили в заблуждение
+        journalctl -u docker --no-pager --since "90 seconds ago" 2>/dev/null \
+            | grep -iE "level=(error|fatal)|failed to start daemon" \
+            | grep -viE "copy stream|closed fifo" | tail -6
         return 1
     }
     return 0
@@ -128,7 +129,11 @@ fi
 err "Ни один обход не помог."
 echo
 echo "Диагностика:"
-systemctl is-active docker && echo "  демон работает, проблема в runc/ядре" || echo "  демон не запущен"
+echo "  storage-driver в daemon.json: $(grep -o '"storage-driver"[^,}]*' /etc/docker/daemon.json 2>/dev/null || echo 'не задан')"
+echo "  runc: $(runc --version 2>/dev/null | head -1)"
+systemctl is-active docker >/dev/null 2>&1 \
+    && echo "  демон работает — проблема в runc/ядре" \
+    || echo "  демон не запущен — см. свежий лог выше"
 docker run --rm hello-world 2>&1 | tail -3
 echo
 echo "Остаётся два варианта:"
