@@ -28,7 +28,10 @@ restart_docker() {
     sleep 3
     systemctl is-active docker >/dev/null 2>&1 || {
         err "демон не стартовал:"
-        journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=(error|fatal)" | tail -5
+        # "copy stream failed / closed fifo" — шум от завершённых контейнеров, не причина
+        journalctl -u docker --no-pager 2>/dev/null \
+            | grep -iE "level=(error|fatal)" \
+            | grep -viE "copy stream|closed fifo" | tail -5
         return 1
     }
     return 0
@@ -69,10 +72,10 @@ EOF
 # ── 2. systemd drop-in: отключаем AppArmor-интеграцию Docker ──────────────────
 say "Шаг 2/4: отключение AppArmor-интеграции Docker"
 mkdir -p /etc/systemd/system/docker.service.d
+# MountFlags устарел и ломает старт новых версий dockerd — не используем
 cat > /etc/systemd/system/docker.service.d/lxc.conf <<'EOF'
 [Service]
 Environment=container=lxc
-MountFlags=slave
 ExecStartPre=-/bin/mount --make-rshared /
 EOF
 
