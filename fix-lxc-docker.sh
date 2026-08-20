@@ -42,6 +42,19 @@ if [ "$(id -u)" != "0" ]; then
     err "запустите от root"; exit 1
 fi
 
+# Если dockerd снесло ранее (откат containerd.io тянет за собой docker-ce)
+if ! command -v dockerd >/dev/null 2>&1; then
+    say "dockerd не найден — переустановка Docker"
+    apt-mark unhold containerd.io docker-ce docker-ce-cli >/dev/null 2>&1
+    apt-get update -qq
+    apt-get install -y docker-ce docker-ce-cli containerd.io         docker-buildx-plugin docker-compose-plugin         || apt-get install -y --fix-broken docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    command -v dockerd >/dev/null 2>&1 || {
+        err "не удалось установить docker-ce — проверьте репозиторий Docker"
+        exit 1
+    }
+    ok "Docker переустановлен"
+fi
+
 say "Текущее состояние"
 unmask_docker
 docker --version 2>/dev/null || { err "docker не установлен"; exit 1; }
@@ -53,7 +66,7 @@ if test_docker; then
 fi
 
 # ── 1. daemon.json: без containerd-snapshotter, драйвер fuse-overlayfs/vfs ─────
-say "Шаг 1/4: настройка storage driver"
+say "Шаг 1/3: настройка storage driver"
 systemctl stop docker docker.socket 2>/dev/null
 mkdir -p /etc/docker
 
@@ -71,7 +84,7 @@ cat > /etc/docker/daemon.json <<EOF
 EOF
 
 # ── 2. systemd drop-in: отключаем AppArmor-интеграцию Docker ──────────────────
-say "Шаг 2/4: отключение AppArmor-интеграции Docker"
+say "Шаг 2/3: отключение AppArmor-интеграции Docker"
 mkdir -p /etc/systemd/system/docker.service.d
 # MountFlags устарел и ломает старт новых версий dockerd — не используем
 cat > /etc/systemd/system/docker.service.d/lxc.conf <<'EOF'
@@ -86,25 +99,10 @@ if test_docker; then
     ok "Заработало после шага 2"; exit 0
 fi
 
-# ── 3. Откат containerd.io до предпатчевой версии ─────────────────────────────
-say "Шаг 3/4: откат containerd.io"
-echo "Доступные версии:"
-apt-cache madison containerd.io 2>/dev/null | head -10
-
-for VER in "1.7.27-1" "1.7.28-1" "1.7.26-1"; do
-    echo "пробуем containerd.io=$VER"
-    if apt-get install -y --allow-downgrades "containerd.io=$VER" >/dev/null 2>&1; then
-        apt-mark hold containerd.io >/dev/null
-        restart_docker
-        if test_docker; then
-            ok "Заработало с containerd.io=$VER (зафиксирован через apt-mark hold)"
-            exit 0
-        fi
-    fi
-done
-
-# ── 4. Подмена бинарника runc на 1.2.6 ────────────────────────────────────────
-say "Шаг 4/4: подмена runc на 1.2.6"
+# ── 3. Подмена бинарника runc на 1.2.6 ─────────────────────────────
+# Откат пакета containerd.io УБРАН: apt сносит вместе с ним docker-ce
+# по зависимостям. Подмена runc даёт тот же эффект и безопасна.
+say "Шаг 3/3: подмена runc на 1.2.6"
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64) RA="amd64" ;;
