@@ -13,11 +13,33 @@ test_docker() {
     docker run --rm hello-world >/dev/null 2>&1
 }
 
+# systemctl часто маскирует docker при откате пакетов — всегда снимаем
+unmask_docker() {
+    systemctl unmask docker.service docker.socket containerd.service >/dev/null 2>&1
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl reset-failed docker >/dev/null 2>&1
+}
+
+restart_docker() {
+    unmask_docker
+    systemctl enable containerd >/dev/null 2>&1
+    systemctl start containerd >/dev/null 2>&1
+    systemctl restart docker >/dev/null 2>&1
+    sleep 3
+    systemctl is-active docker >/dev/null 2>&1 || {
+        err "демон не стартовал:"
+        journalctl -u docker --no-pager 2>/dev/null | grep -iE "level=(error|fatal)" | tail -5
+        return 1
+    }
+    return 0
+}
+
 if [ "$(id -u)" != "0" ]; then
     err "запустите от root"; exit 1
 fi
 
 say "Текущее состояние"
+unmask_docker
 docker --version 2>/dev/null || { err "docker не установлен"; exit 1; }
 runc --version 2>/dev/null | head -1
 systemd-detect-virt || true
@@ -54,9 +76,7 @@ MountFlags=slave
 ExecStartPre=-/bin/mount --make-rshared /
 EOF
 
-systemctl daemon-reload
-systemctl reset-failed docker
-systemctl start docker && sleep 3
+restart_docker
 
 if test_docker; then
     ok "Заработало после шага 2"; exit 0
@@ -71,7 +91,7 @@ for VER in "1.7.27-1" "1.7.28-1" "1.7.26-1"; do
     echo "пробуем containerd.io=$VER"
     if apt-get install -y --allow-downgrades "containerd.io=$VER" >/dev/null 2>&1; then
         apt-mark hold containerd.io >/dev/null
-        systemctl restart docker; sleep 3
+        restart_docker
         if test_docker; then
             ok "Заработало с containerd.io=$VER (зафиксирован через apt-mark hold)"
             exit 0
@@ -95,7 +115,7 @@ if curl -fsSL -o /tmp/runc.new \
     [ -f "$RUNC_BIN.bak" ] || cp "$RUNC_BIN" "$RUNC_BIN.bak"
     mv /tmp/runc.new "$RUNC_BIN"
     echo "установлен: $($RUNC_BIN --version | head -1)"
-    systemctl restart docker; sleep 3
+    restart_docker
     if test_docker; then
         ok "Заработало с runc 1.2.6 (бэкап: $RUNC_BIN.bak)"
         exit 0
@@ -103,6 +123,10 @@ if curl -fsSL -o /tmp/runc.new \
 fi
 
 err "Ни один обход не помог."
+echo
+echo "Диагностика:"
+systemctl is-active docker && echo "  демон работает, проблема в runc/ядре" || echo "  демон не запущен"
+docker run --rm hello-world 2>&1 | tail -3
 echo
 echo "Остаётся два варианта:"
 echo "  1) Попросить хостера включить на хосте:"
