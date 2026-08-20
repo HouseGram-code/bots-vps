@@ -41,3 +41,31 @@ VPS_IMAGE_NAME   = _env_str("VPS_IMAGE_NAME", "vps-bot-ubuntu")
 
 # Абсолютный путь — чтобы БД не терялась при другом рабочем каталоге на сервере
 DB_PATH = _env_str("DB_PATH", os.path.join(BASE_DIR, "data", "vps_bot.db"))
+
+
+def _detect_lxc():
+    """В LXC AppArmor ломает runc — контейнеры нужно создавать unconfined."""
+    forced = (os.getenv("LXC_MODE") or "").strip().lower()
+    if forced in ("1", "true", "yes"):
+        return True
+    if forced in ("0", "false", "no"):
+        return False
+    try:
+        with open("/proc/1/environ", "rb") as f:
+            if b"container=lxc" in f.read():
+                return True
+    except Exception:
+        pass
+    for probe in ("/dev/.lxc", "/run/.containerenv"):
+        if os.path.exists(probe):
+            return True
+    try:
+        with open("/proc/self/cgroup", "r") as f:
+            if "lxc" in f.read():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+LXC_MODE = _detect_lxc()

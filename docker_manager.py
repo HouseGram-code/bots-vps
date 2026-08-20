@@ -4,7 +4,16 @@ import threading
 
 import docker
 
-from config import VPS_IMAGE_NAME, VPS_MEMORY_LIMIT, VPS_CPU_QUOTA, VPS_CPU_PERIOD
+from config import (
+    VPS_IMAGE_NAME, VPS_MEMORY_LIMIT, VPS_CPU_QUOTA, VPS_CPU_PERIOD,
+    LXC_MODE,
+)
+
+
+def _security_opt():
+    """В LXC AppArmor блокирует runc (MS_PRIVATE: permission denied).
+    Отключаем профиль для выдаваемых VPS-контейнеров."""
+    return ["apparmor=unconfined"] if LXC_MODE else None
 
 _client = None
 _client_lock = threading.Lock()
@@ -27,6 +36,30 @@ def client():
                 )
                 _client.ping()
         return _client
+
+# ── Diagnostics ───────────────────────────────────────────────────────
+
+def diagnose():
+    """Проверяет доступность демона и отдаёт человеческую подсказку."""
+    try:
+        info = client().info()
+    except Exception as e:
+        return False, (
+            f"[docker] демон недоступен: {e}\n"
+            "  → проверьте проброс /var/run/docker.sock и systemctl status docker"
+        )
+    driver = info.get("Driver", "?")
+    runc_v = (info.get("RuncCommit", {}) or {}).get("ID", "?")[:12]
+    lines = [
+        f"[docker] версия: {info.get('ServerVersion', '?')}",
+        f"[docker] storage driver: {driver}",
+        f"[docker] runc: {runc_v}",
+        f"[docker] LXC_MODE: {LXC_MODE}",
+    ]
+    if LXC_MODE:
+        lines.append("[docker] LXC обнаружен — VPS создаются с apparmor=unconfined")
+    return True, "\n".join(lines)
+
 
 # ── Image ──────────────────────────────────────────────────────────────────────
 
@@ -83,11 +116,25 @@ def create_container(user_id: int, name: str):
             restart_policy={"Name": "unless-stopped"},
             pids_limit=256,
             network_mode="bridge",
+            security_opt=_security_opt(),
         )
         return c
     except Exception as e:
-        print(f"[docker] create error: {e}")
-        return None
+        # Фоллбэк: если демон не знает security_opt/pids_limit — пробуем минимально
+        print(f"[docker] create error: {e}; retry без доп. опций")
+        try:
+            return client().containers.run(
+                VPS_IMAGE_NAME,
+                name=name,
+                detach=True,
+                stdin_open=True,
+                tty=True,
+                mem_limit=VPS_MEMORY_LIMIT,
+                labels={"vps-bot-user": str(user_id), "vps-bot": "1"},
+            )
+        except Exception as e2:
+            print(f"[docker] create failed: {e2}")
+            return None
 
 def get_container(container_id: str):
     if not container_id:

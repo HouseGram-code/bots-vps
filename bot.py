@@ -901,6 +901,13 @@ def main():
     db.init_db()
     print("✅ База данных готова")
 
+    print("🐳 Проверка Docker...")
+    ok, info = dm.diagnose()
+    print(info)
+    if not ok:
+        print("❌ Docker не готов — см. сообщение выше")
+        raise SystemExit(1)
+
     print("🐳 Проверка Docker образа...")
     if not dm.ensure_image():
         print("❌ Не удалось собрать образ! Проверьте Docker и проброс /var/run/docker.sock")
