@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+*.db
+.env
+# .env.example НЕ игнорируется — он нужен на сервере
+!.env.example

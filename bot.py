@@ -2,18 +2,25 @@
 """VPSNovaBot — Free VPS in Telegram"""
 
 import os
+import sys
 import time
 import threading
+import traceback
 
 import telebot
 from telebot import types
-from dotenv import load_dotenv
-
-load_dotenv()
 
 import database as db
 import docker_manager as dm
 from config import BOT_TOKEN, ADMIN_ID, MAX_VPS_PER_USER
+
+# .env / .env.example грузит config.py — повторный load_dotenv() тут не нужен
+
+if not BOT_TOKEN or ":" not in BOT_TOKEN:
+    print("❌ BOT_TOKEN не задан. Укажите его в .env или .env.example")
+    raise SystemExit(1)
+
+_deploy_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bot instance
@@ -108,11 +115,14 @@ def _edit(chat_id, msg_id, text, kb=None):
     try:
         bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id,
                               reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        pass
+    except Exception as e:
+        # "message is not modified" и прочие ошибки не должны ронять поток
+        if "message is not modified" not in str(e):
+            print(f"[edit] {e}")
 
 def _vps_card(vps, stats=None):
-    vid, uid, cid, cname, status, osname, created = vps
+    vid, uid, cid, cname, status, osname, created = vps[:7]
+    created = str(created or "")
     sem = "🟢 Online" if status == "running" else "🔴 Offline"
     lines = [
         f"🖥️ <b>{cname}</b>",
@@ -121,7 +131,7 @@ def _vps_card(vps, stats=None):
         f"├ 🆔 ID: <code>{vid}</code>",
         f"├ 🐧 OS: {osname}",
         f"├ 📡 Статус: {sem}",
-        f"└ 📅 Создан: {created[:10]}",
+        f"└ 📅 Создан: {created[:10] or '—'}",
         "",
         "⚙️ <b>Конфигурация</b>",
         "├ 💻 CPU: 0.5 vCore",
@@ -175,7 +185,7 @@ def kb_os():
 def kb_vps_list(rows):
     m = types.InlineKeyboardMarkup(row_width=1)
     for row in rows:
-        vid, uid, cid, cname, status, osname, created = row
+        vid, uid, cid, cname, status, osname, created = row[:7]
         em = "🟢" if status == "running" else "🔴"
         m.add(types.InlineKeyboardButton(f"{em} {cname}  |  {osname}",
                                           callback_data=f"vps_{vid}"))
@@ -320,7 +330,10 @@ def handle_admin_input(msg):
         return
 
     action = task["action"]
-    text   = msg.text.strip()
+    text   = (msg.text or "").strip()
+    if not text:
+        bot.send_message(msg.chat.id, "❌ Нужен текст. Попробуйте снова.", reply_markup=kb_admin())
+        return
 
     if action == "ban":
         try:
@@ -393,7 +406,10 @@ def on_callback(call):
     data = call.data
 
     db.upsert_user(uid, call.from_user.username, call.from_user.first_name)
-    bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass  # устаревший callback — не причина падать
 
     # Admin-only callbacks
     if data.startswith("adm_"):
@@ -650,7 +666,7 @@ def _show_profile(call):
     user = db.get_user(uid)
     n = db.count_vps(uid)
     uname = f"@{call.from_user.username}" if call.from_user.username else "—"
-    reg = user[3][:10] if user else "сегодня"
+    reg = str(user[3])[:10] if user and len(user) > 3 and user[3] else "сегодня"
     limit = "∞" if _is_admin(uid) else str(MAX_VPS_PER_USER)
     _edit(call.message.chat.id, call.message.message_id,
           f"👤 <b>Профиль</b>\n\n"
@@ -707,7 +723,10 @@ def _show_list_cb(cid, mid, uid):
 
 def _refresh_statuses(rows):
     for r in rows:
-        c = dm.get_container(r[2])
+        try:
+            c = dm.get_container(r[2])
+        except Exception:
+            c = None
         db.update_status(r[0], c.status if c else "exited")
 
 def _show_vps(cid, mid, uid, vps_id):
@@ -761,23 +780,36 @@ def _do_deploy_msg(chat_id, uid):
     threading.Thread(target=_deploy_worker, args=(chat_id, msg.message_id, uid), daemon=True).start()
 
 def _deploy_worker(cid, mid, uid):
-    for frame in DEPLOY_ANIM[1:]:
-        time.sleep(0.8)
-        _edit(cid, mid, frame)
+    try:
+        for frame in DEPLOY_ANIM[1:]:
+            time.sleep(0.8)
+            _edit(cid, mid, frame)
 
-    name = f"vps-{uid}-{int(time.time())}"
-    c = dm.create_container(uid, name)
-    if not c:
-        _edit(cid, mid,
-              "❌ <b>Ошибка создания VPS</b>\n\nНе удалось запустить контейнер.\n"
-              "Убедитесь что Docker запущен.",
-              kb_back())
-        return
+        # Лок: без него два одновременных деплоя пробивали лимит слотов
+        with _deploy_lock:
+            if db.count_all_vps() >= db.get_total_slots():
+                _edit(cid, mid, "😔 <b>Слоты заняты</b>\n\nПопробуйте позже.", kb_back())
+                return
+            if not _is_admin(uid) and db.count_vps(uid) >= MAX_VPS_PER_USER:
+                _edit(cid, mid, "❌ <b>Лимит!</b> У вас уже есть VPS.", kb_back())
+                return
 
-    vps_id = db.add_vps(uid, c.id, name)
-    vps    = db.get_vps(vps_id)
-    stats  = dm.get_stats(c.id)
-    _edit(cid, mid, _vps_card(vps, stats), kb_vps_ctrl(vps_id, "running"))
+            name = f"vps-{uid}-{int(time.time())}"
+            c = dm.create_container(uid, name)
+            if not c:
+                _edit(cid, mid,
+                      "❌ <b>Ошибка создания VPS</b>\n\nНе удалось запустить контейнер.\n"
+                      "Убедитесь что Docker запущен и сокет проброшен в контейнер бота.",
+                      kb_back())
+                return
+            vps_id = db.add_vps(uid, c.id, name)
+
+        vps   = db.get_vps(vps_id)
+        stats = dm.get_stats(c.id)
+        _edit(cid, mid, _vps_card(vps, stats), kb_vps_ctrl(vps_id, "running"))
+    except Exception:
+        traceback.print_exc()
+        _edit(cid, mid, "❌ <b>Внутренняя ошибка при создании VPS</b>", kb_back())
 
 # ── Controls ───────────────────────────────────────────────────────────────────
 
@@ -864,16 +896,37 @@ def _do_delete(cid, mid, uid, vps_id):
 #  Entry
 # ══════════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+def main():
     print("🚀 VPSNovaBot запускается...")
     db.init_db()
     print("✅ База данных готова")
 
     print("🐳 Проверка Docker образа...")
     if not dm.ensure_image():
-        print("❌ Не удалось собрать образ! Проверьте Docker.")
+        print("❌ Не удалось собрать образ! Проверьте Docker и проброс /var/run/docker.sock")
         raise SystemExit(1)
     print("✅ Docker образ готов")
 
+    # Снимаем возможный webhook — иначе polling получает 409 Conflict
+    try:
+        bot.remove_webhook()
+        time.sleep(0.5)
+    except Exception as e:
+        print(f"[warn] remove_webhook: {e}")
+
     print("✅ VPSNovaBot запущен!")
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    while True:
+        try:
+            bot.infinity_polling(timeout=20, long_polling_timeout=20,
+                                 skip_pending=True, allowed_updates=None)
+        except KeyboardInterrupt:
+            print("⏹️ Остановка")
+            break
+        except Exception:
+            traceback.print_exc()
+            print("[polling] перезапуск через 5с...")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

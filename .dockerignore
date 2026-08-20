@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+data/
+*.db
+.postman/
+postman/
+README.md
+# .env.example НЕ игнорируем — он нужен внутри образа

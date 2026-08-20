@@ -1,10 +1,21 @@
-import sqlite3
 import os
+import sqlite3
+import threading
+
 from config import DB_PATH, DEFAULT_TOTAL_SLOTS
 
+_lock = threading.RLock()
+
+
 def _conn():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    d = os.path.dirname(os.path.abspath(DB_PATH))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    # timeout + WAL: иначе при работе из потоков падает 'database is locked'
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
 
 def init_db():
     con = _conn()
@@ -59,8 +70,11 @@ def init_db():
 
 def upsert_user(user_id, username, first_name):
     con = _conn()
+    # было INSERT OR REPLACE — он сбрасывал created_at при каждом клике
     con.execute(
-        "INSERT OR REPLACE INTO users (user_id, username, first_name) VALUES (?,?,?)",
+        """INSERT INTO users (user_id, username, first_name) VALUES (?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+                                              first_name=excluded.first_name""",
         (user_id, username or "", first_name or "")
     )
     con.commit()

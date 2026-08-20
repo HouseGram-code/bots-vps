@@ -1,15 +1,14 @@
-version: "3.9"
-
 services:
   vps-bot:
     build: .
+    image: vps-telegram-bot:latest
     container_name: vps-telegram-bot
     restart: unless-stopped
-    environment:
-      - BOT_TOKEN=${BOT_TOKEN}
+    # .env.example всегда есть в репозитории — создавать .env на сервере не нужно.
+    # Если .env всё-таки создадите, он подхватится и перекроет значения.
+    env_file:
+      - .env.example
     volumes:
-      # Allow bot to manage sibling Docker containers
       - /var/run/docker.sock:/var/run/docker.sock
-      # Persist database
       - ./data:/app/data
     working_dir: /app

@@ -1,15 +1,32 @@
-import docker
+import os
 import time
 import threading
+
+import docker
+
 from config import VPS_IMAGE_NAME, VPS_MEMORY_LIMIT, VPS_CPU_QUOTA, VPS_CPU_PERIOD
 
 _client = None
+_client_lock = threading.Lock()
+
 
 def client():
+    """Ленивый потокобезопасный клиент. На VPS docker.from_env() часто падал,
+    если DOCKER_HOST не задан — фоллбэк на unix-сокет."""
     global _client
-    if _client is None:
-        _client = docker.from_env()
-    return _client
+    with _client_lock:
+        if _client is None:
+            try:
+                _client = docker.from_env(timeout=120)
+                _client.ping()
+            except Exception as e:
+                print(f"[docker] from_env failed: {e}; trying unix socket")
+                _client = docker.DockerClient(
+                    base_url=os.getenv("DOCKER_HOST", "unix:///var/run/docker.sock"),
+                    timeout=120,
+                )
+                _client.ping()
+        return _client
 
 # ── Image ──────────────────────────────────────────────────────────────────────
 
@@ -20,11 +37,23 @@ def ensure_image():
         return True
     except docker.errors.ImageNotFound:
         pass
+    except Exception as e:
+        print(f"[docker] daemon unreachable: {e}")
+        return False
+
+    image_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vps_image")
+    if not os.path.isdir(image_dir):
+        print(f"[docker] image dir not found: {image_dir}")
+        return False
     try:
-        import os
-        image_dir = os.path.join(os.path.dirname(__file__), "vps_image")
         print(f"[docker] Building image {VPS_IMAGE_NAME} from {image_dir} ...")
-        client().images.build(path=image_dir, tag=VPS_IMAGE_NAME, rm=True)
+        _img, logs = client().images.build(
+            path=image_dir, tag=VPS_IMAGE_NAME, rm=True, forcerm=True, pull=False
+        )
+        for chunk in logs:
+            line = (chunk.get("stream") or "").rstrip()
+            if line:
+                print(f"[build] {line}")
         print("[docker] Image built successfully.")
         return True
     except Exception as e:
@@ -35,6 +64,12 @@ def ensure_image():
 
 def create_container(user_id: int, name: str):
     try:
+        # если контейнер с таким именем висит — убираем, иначе 409 Conflict
+        try:
+            old = client().containers.get(name)
+            old.remove(force=True)
+        except Exception:
+            pass
         c = client().containers.run(
             VPS_IMAGE_NAME,
             name=name,
@@ -45,7 +80,9 @@ def create_container(user_id: int, name: str):
             cpu_period=VPS_CPU_PERIOD,
             cpu_quota=VPS_CPU_QUOTA,
             labels={"vps-bot-user": str(user_id), "vps-bot": "1"},
-            restart_policy={"Name": "no"},
+            restart_policy={"Name": "unless-stopped"},
+            pids_limit=256,
+            network_mode="bridge",
         )
         return c
     except Exception as e:
@@ -53,8 +90,12 @@ def create_container(user_id: int, name: str):
         return None
 
 def get_container(container_id: str):
+    if not container_id:
+        return None
     try:
-        return client().containers.get(container_id)
+        c = client().containers.get(container_id)
+        c.reload()
+        return c
     except Exception:
         return None
 
@@ -108,18 +149,24 @@ def get_stats(container_id: str):
             return None
         raw = c.stats(stream=False)
 
-        # CPU %
-        cd = raw["cpu_stats"]["cpu_usage"]["total_usage"] - \
-             raw["precpu_stats"]["cpu_usage"]["total_usage"]
-        sd = raw["cpu_stats"].get("system_cpu_usage", 0) - \
-             raw["precpu_stats"].get("system_cpu_usage", 0)
-        ncpu = raw["cpu_stats"].get("online_cpus", 1)
-        cpu_pct = round((cd / sd) * ncpu * 100.0, 1) if sd > 0 else 0.0
+        # CPU % (cgroup v1/v2 safe)
+        cpu_now  = raw.get("cpu_stats", {})
+        cpu_prev = raw.get("precpu_stats", {})
+        cd = cpu_now.get("cpu_usage", {}).get("total_usage", 0) - \
+             cpu_prev.get("cpu_usage", {}).get("total_usage", 0)
+        sd = (cpu_now.get("system_cpu_usage") or 0) - \
+             (cpu_prev.get("system_cpu_usage") or 0)
+        ncpu = cpu_now.get("online_cpus") or \
+               len(cpu_now.get("cpu_usage", {}).get("percpu_usage") or [1]) or 1
+        cpu_pct = round((cd / sd) * ncpu * 100.0, 1) if sd > 0 and cd > 0 else 0.0
+        cpu_pct = max(0.0, min(cpu_pct, 100.0 * ncpu))
 
-        # Memory
-        mem = raw["memory_stats"]
-        usage = mem.get("usage", 0) - mem.get("stats", {}).get("cache", 0)
-        limit = mem.get("limit", 1)
+        # Memory (cgroup v2 использует inactive_file, v1 — cache)
+        mem = raw.get("memory_stats", {}) or {}
+        mstats = mem.get("stats", {}) or {}
+        cache = mstats.get("inactive_file", mstats.get("cache", 0)) or 0
+        usage = max((mem.get("usage", 0) or 0) - cache, 0)
+        limit = mem.get("limit") or 1
         mem_mb = round(usage / 1048576, 0)
         lim_mb = round(limit / 1048576, 0)
 
@@ -156,24 +203,31 @@ def get_tmate_ssh(container_id: str) -> str | None:
     if not c or c.status != "running":
         return None
     try:
-        # Kill any leftover session
-        c.exec_run("pkill -f tmate", user="root")
-        time.sleep(1)
-        # Start detached session
+        # tmate не стартует без ssh-ключа — гарантируем его наличие
         c.exec_run(
-            "bash -c 'rm -f /tmp/t.sock && tmate -S /tmp/t.sock new-session -d 2>/dev/null'",
-            detach=True, user="root"
+            ["bash", "-lc",
+             "mkdir -p /root/.ssh && chmod 700 /root/.ssh && "
+             "[ -f /root/.ssh/id_rsa ] || ssh-keygen -q -t rsa -b 2048 -N '' -f /root/.ssh/id_rsa"],
+            user="root",
         )
-        time.sleep(4)
-        # Retrieve SSH line
-        for attempt in range(3):
+        # Сносим старую сессию
+        c.exec_run(["bash", "-lc", "pkill -f tmate || true; rm -f /tmp/t.sock"], user="root")
+        time.sleep(1)
+        # Стартуем detached-сессию
+        c.exec_run(
+            ["bash", "-lc", "tmate -S /tmp/t.sock new-session -d"],
+            detach=True, user="root",
+        )
+        # Ждём готовность сокета вместо слепого sleep(4)
+        c.exec_run(["bash", "-lc", "tmate -S /tmp/t.sock wait tmate-ready"], user="root")
+        for _ in range(6):
             res = c.exec_run(
-                "tmate -S /tmp/t.sock display -p '#{tmate_ssh}'",
-                user="root"
+                ["bash", "-lc", "tmate -S /tmp/t.sock display -p '#{tmate_ssh}'"],
+                user="root",
             )
             out = res.output.decode("utf-8", errors="ignore").strip()
             if out and "@" in out and "tmate.io" in out:
-                return out
+                return out.splitlines()[-1].strip()
             time.sleep(2)
         return None
     except Exception as e:
