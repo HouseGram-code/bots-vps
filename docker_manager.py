@@ -180,10 +180,15 @@ def remove_container(container_id: str) -> bool:
     c = get_container(container_id)
     if c:
         try:
-            c.remove(force=True)
+            # restart_policy=unless-stopped может поднять контейнер снова — сначала гасим
+            try:
+                c.stop(timeout=5)
+            except Exception:
+                pass
+            c.remove(force=True, v=True)
             return True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[docker] remove error: {e}")
     return False
 
 # ── Stats ──────────────────────────────────────────────────────────────────────
@@ -266,7 +271,11 @@ def get_tmate_ssh(container_id: str) -> str | None:
             detach=True, user="root",
         )
         # Ждём готовность сокета вместо слепого sleep(4)
-        c.exec_run(["bash", "-lc", "tmate -S /tmp/t.sock wait tmate-ready"], user="root")
+        # без timeout этот exec мог висеть вечно и навсегда блокировал поток бота
+        c.exec_run(
+            ["bash", "-lc", "timeout 25 tmate -S /tmp/t.sock wait tmate-ready || true"],
+            user="root",
+        )
         for _ in range(6):
             res = c.exec_run(
                 ["bash", "-lc", "tmate -S /tmp/t.sock display -p '#{tmate_ssh}'"],

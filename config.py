@@ -32,7 +32,11 @@ BOT_TOKEN = _env_str("BOT_TOKEN", _DEFAULT_TOKEN)
 ADMIN_ID  = _env_int("ADMIN_ID", _DEFAULT_ADMIN)
 
 MAX_VPS_PER_USER    = _env_int("MAX_VPS_PER_USER", 1)   # обычным юзерам — 1 VPS
+if MAX_VPS_PER_USER < 1:
+    MAX_VPS_PER_USER = 1
 DEFAULT_TOTAL_SLOTS = _env_int("TOTAL_SLOTS", 10)       # всего слотов
+if DEFAULT_TOTAL_SLOTS < 1:
+    DEFAULT_TOTAL_SLOTS = 1
 
 VPS_MEMORY_LIMIT = _env_str("VPS_MEMORY_LIMIT", "512m")
 VPS_CPU_QUOTA    = _env_int("VPS_CPU_QUOTA", 50000)
@@ -56,7 +60,8 @@ def _detect_lxc():
                 return True
     except Exception:
         pass
-    for probe in ("/dev/.lxc", "/run/.containerenv"):
+    # /run/.containerenv — это podman, а не LXC: давал ложное срабатывание
+    for probe in ("/dev/.lxc",):
         if os.path.exists(probe):
             return True
     try:

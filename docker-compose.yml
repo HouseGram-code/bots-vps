@@ -4,15 +4,23 @@ services:
     image: vps-telegram-bot:latest
     container_name: vps-telegram-bot
     restart: unless-stopped
-    # .env.example всегда есть в репозитории — создавать .env на сервере не нужно.
-    # Если .env всё-таки создадите, он подхватится и перекроет значения.
+    # .env — приоритетный, .env.example — фоллбэк.
+    # required: false — чтобы compose не падал, если файла нет.
     env_file:
-      - .env.example
+      - path: ./.env
+        required: false
+      - path: ./.env.example
+        required: false
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
     working_dir: /app
-    # На LXC-хостах AppArmor ломает runc — выставь LXC_MODE=1 в .env.example
+    # На LXC-хостах AppArmor ломает runc — выставь LXC_MODE=1 в .env
     # (если не задано, бот определит LXC автоматически)
     security_opt:
       - apparmor=unconfined
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

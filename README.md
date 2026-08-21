@@ -19,22 +19,32 @@
 | RAM     | 512 MB   |
 | CPU     | 0.5 vCPU |
 | Disk    | ~512 MB  |
-| VPS/user | 2       |
+| VPS/user | 1 (MAX_VPS_PER_USER) |
 
-## Быстрый старт
-
-### 1. Настройка
+## Быстрый старт (VPS, от root)
 
 ```bash
-cp .env.example .env
-# Отредактируй .env — вставь токен бота от @BotFather
+apt update && apt install -y unzip curl git
+unzip -o bots-vps-master.zip -d /opt && cd /opt/bots-vps-master
+cp .env.example .env && nano .env      # свой BOT_TOKEN и ADMIN_ID
+chmod +x install.sh && ./install.sh
 ```
 
-### 2. Запуск через Docker Compose (рекомендуется)
+`install.sh` сам поставит Docker + compose-плагин, проверит `docker run hello-world`,
+при необходимости запустит `fix-lxc-docker.sh` (LXC/OpenVZ) и подымет бота.
+
+Вручную то же самое:
 
 ```bash
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+mkdir -p data && cp .env.example .env   # и вписать свой токен
 docker compose up -d --build
+docker compose logs -f --tail=100
 ```
+
+⚠️ Токен из `.env.example` — демонстрационный и публичный. Обязательно замените
+его своим и отзовите старый через @BotFather.
 
 ### 3. Запуск локально (Python)
 

@@ -1,5 +1,7 @@
-pyTelegramBotAPI==4.36.1
-docker==7.2.0
-python-dotenv==1.2.3
-requests==2.32.5
-urllib3==2.5.0
+# Жёсткие пины были на несуществующие версии (docker==7.2.0, python-dotenv==1.2.3,
+# pyTelegramBotAPI==4.36.1) — pip падал с "No matching distribution found".
+pyTelegramBotAPI>=4.14,<5
+docker>=6.1,<8
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+urllib3>=1.26,<3
