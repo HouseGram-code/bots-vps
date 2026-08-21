@@ -23,6 +23,8 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
 
 _deploy_lock = threading.Lock()
 
+BOT_VERSION = "1.0 бета"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bot instance
 # ══════════════════════════════════════════════════════════════════════════════
@@ -223,7 +225,14 @@ def kb_confirm_del(vps_id):
 def kb_profile():
     m = types.InlineKeyboardMarkup(row_width=1)
     m.add(types.InlineKeyboardButton("❓ Частые вопросы (FAQ)", callback_data="faq"))
+    m.add(types.InlineKeyboardButton("📜 Правила сервиса", callback_data="rules"))
     m.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
+    return m
+
+def kb_rules_back():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("❓ Частые вопросы", callback_data="faq"))
+    m.add(types.InlineKeyboardButton("🔙 Назад", callback_data="profile"))
     return m
 
 def kb_faq():
@@ -231,6 +240,8 @@ def kb_faq():
     m.add(types.InlineKeyboardButton("❌ VPS не работает",         callback_data="faq_1"))
     m.add(types.InlineKeyboardButton("⚠️ Произошёл сбой",          callback_data="faq_2"))
     m.add(types.InlineKeyboardButton("📈 Почему сервер нагружен?", callback_data="faq_3"))
+    m.add(types.InlineKeyboardButton("💚 Бесплатно — реально?",   callback_data="faq_4"))
+    m.add(types.InlineKeyboardButton("📜 Правила сервиса",       callback_data="rules"))
     m.add(types.InlineKeyboardButton("🔙 Назад",                   callback_data="profile"))
     return m
 
@@ -532,6 +543,51 @@ def _on_callback(call):
               "Если >80% — остановите лишние процессы внутри VPS.",
               kb_faq_back())
 
+    elif data == "faq_4":
+        _edit(cid, mid,
+              "💚 <b>Бесплатно — реально?</b>\n\n"
+              "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+              "✅ <b>Да, тариф полностью бесплатный.</b>\n"
+              "Без оплаты, без карты и без скрытых платежей.\n\n"
+              "🎁 <b>Что вы получаете:</b>\n"
+              "├ 🐧 Ubuntu 22.04 с root-доступом\n"
+              "├ 🧠 512 MB RAM • 💻 0.5 vCPU • 💿 512 MB\n"
+              "└ 🔑 SSH через TMATE\n\n"
+              "⚠️ <b>Говорим честно:</b>\n"
+              "бесплатные VPS живут на общем хосте, поэтому иногда бывает "
+              "небольшая нагрузка сервиса: просадки скорости, задержки при "
+              "создании VPS или короткие тех. работы.\n\n"
+              "🛠️ Мы всё понимаем и постоянно работаем над стабильностью — "
+              "будем стараться всё починить и ускорить.\n\n"
+              "<i>Спасибо за понимание и терпение! 🙏</i>",
+              kb_faq_back())
+
+    # ── Правила ────────────────────────────────────────────────
+    elif data == "rules":
+        _edit(cid, mid,
+              "📜 <b>Правила сервиса</b>\n\n"
+              "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+              "<b>1️⃣ Вежливость</b>\n"
+              "Обращайтесь к администратору и другим пользователям вежливо. "
+              "Без оскорблений, угроз, спама и требований в приказном тоне.\n\n"
+              "<b>2️⃣ Один VPS — один человек</b>\n"
+              "Мультиаккаунты ради лишних слотов запрещены — слотов мало, "
+              "их должно хватить всем.\n\n"
+              "<b>3️⃣ Никакого вреда</b>\n"
+              "Запрещены майнинг, DDoS, брутфорс, ботнеты, сканеры сетей, "
+              "фишинг и любая незаконная активность.\n\n"
+              "<b>4️⃣ Берегите ресурсы</b>\n"
+              "Не держите CPU в 100% круглосуточно: сборки, стресс-тесты и "
+              "тяжёлые задачи мешают остальным и могут быть остановлены.\n\n"
+              "<b>5️⃣ Без важных данных</b>\n"
+              "Тариф бесплатный: VPS может быть перезапущен или очищен. "
+              "Делайте бэкапы сами.\n\n"
+              "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+              "🚫 Нарушение любого пункта — удаление VPS или бан без возврата слота.\n"
+              "💬 Вопрос или спорная ситуация? Напишите админу спокойно и по делу — "
+              "таким обращениям помогаем в первую очередь.",
+              kb_rules_back())
+
     # ── Deploy ─────────────────────────────────────────────────────────────
     elif data.startswith("deploy_"):
         _deploy_cb(cid, mid, uid)
@@ -706,7 +762,8 @@ def _show_profile(call):
           f"├ 🔖 Username: {uname}\n"
           f"├ 🆔 ID:       <code>{uid}</code>\n"
           f"├ 🖥️ Серверов: <b>{n}</b> / {limit}\n"
-          f"└ 📅 С нами:   {reg}\n\n"
+          f"├ 📅 С нами:   {reg}\n"
+          f"└ 🤖 Версия бота: <b>{BOT_VERSION}</b>\n\n"
           "━━━━━━━━━━━━━━━━━━━━━━",
           kb_profile())
 
