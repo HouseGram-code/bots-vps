@@ -2,6 +2,7 @@
 """VPSNovaBot — Free VPS in Telegram"""
 
 import os
+import re
 import sys
 import time
 import threading
@@ -303,6 +304,7 @@ def cmd_deploy(msg):
     db.upsert_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     if not _check(msg):
         return
+    _pending.pop(msg.from_user.id, None)   # сбрасываем висячий ввод админки
     _do_deploy_msg(msg.chat.id, msg.from_user.id)
 
 @bot.message_handler(func=lambda m: m.text and m.text.strip().lower().startswith("!manage"))
@@ -312,6 +314,7 @@ def cmd_manage_cmd(msg):
     db.upsert_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name)
     if not _check(msg):
         return
+    _pending.pop(msg.from_user.id, None)
     _show_list_msg(msg.chat.id, msg.from_user.id)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -380,6 +383,15 @@ def handle_admin_input(msg):
     elif action == "give_vps_2":
         target_uid = task["data"]
         cname = text if text else f"vps-{target_uid}-gift"
+        # имя контейнера Docker принимает только [a-zA-Z0-9_.-]
+        cname = re.sub(r"[^a-zA-Z0-9_.-]", "-", cname)[:60].strip("-") or f"vps-{target_uid}-gift"
+        # раньше выдача VPS админом игнорировала лимит слотов
+        if db.count_all_vps() >= db.get_total_slots():
+            bot.send_message(msg.chat.id,
+                f"❌ Слоты заняты ({db.count_all_vps()}/{db.get_total_slots()}). "
+                "Увеличьте число слотов в админке.",
+                reply_markup=kb_admin())
+            return
         # Deploy container
         c = dm.create_container(target_uid, cname)
         if c:
@@ -388,6 +400,12 @@ def handle_admin_input(msg):
             bot.send_message(msg.chat.id,
                 f"✅ VPS <b>{cname}</b> выдан пользователю <code>{target_uid}</code>",
                 reply_markup=kb_admin())
+            try:
+                bot.send_message(target_uid,
+                    f"🎁 Вам выдан VPS <b>{cname}</b>!\n"
+                    "Откройте <b>📋 Мои серверы</b> или отправьте !manage")
+            except Exception as e:
+                print(f"[notify] {e}")
         else:
             bot.send_message(msg.chat.id, "❌ Ошибка создания контейнера.", reply_markup=kb_admin())
 
@@ -397,6 +415,19 @@ def handle_admin_input(msg):
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(call):
+    """Обёртка: любая ошибка (напр. битый callback_data → ValueError)
+    больше не роняет обработку апдейтов."""
+    try:
+        _on_callback(call)
+    except Exception:
+        traceback.print_exc()
+        try:
+            bot.answer_callback_query(call.id, "⚠️ Ошибка, попробуйте ещё раз")
+        except Exception:
+            pass
+
+
+def _on_callback(call):
     if call.message.chat.type != "private":
         return
 
@@ -799,7 +830,7 @@ def _deploy_worker(cid, mid, uid):
             if not c:
                 _edit(cid, mid,
                       "❌ <b>Ошибка создания VPS</b>\n\nНе удалось запустить контейнер.\n"
-                      "Убедитесь что Docker запущен и сокет проброшен в контейнер бота.",
+                      "Убедитесь что Docker запущен и сокет пробр��шен в контейнер бота.",
                       kb_back())
                 return
             vps_id = db.add_vps(uid, c.id, name)
@@ -816,6 +847,15 @@ def _deploy_worker(cid, mid, uid):
 def _do_tmate(cid, mid, uid, vps_id):
     vps = db.get_vps(vps_id)
     if not vps or vps[1] != uid:
+        return
+    # раньше бот крутил анимацию 5 сек и только потом говорил об ошибке
+    c = dm.get_container(vps[2])
+    if not c or c.status != "running":
+        db.update_status(vps_id, c.status if c else "exited")
+        _edit(cid, mid,
+              "⚠️ <b>VPS остановлен</b>\n\n"
+              "Запустите сервер кнопкой <b>▶️ Запустить</b>, потом берите SSH.",
+              kb_vps_ctrl(vps_id, "exited"))
         return
     _edit(cid, mid, TMATE_ANIM[0])
 

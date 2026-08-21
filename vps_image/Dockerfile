@@ -10,7 +10,7 @@ RUN apt-get update && \
         nano vim htop procps psmisc \
         net-tools iputils-ping \
         openssh-client \
-        xz-utils tar bash && \
+        xz-utils tar bash coreutils && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
