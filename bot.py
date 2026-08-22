@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """VPSNovaBot — Free VPS in Telegram"""
 
+import html
 import os
 import re
 import sys
@@ -24,6 +25,20 @@ if not BOT_TOKEN or ":" not in BOT_TOKEN:
 _deploy_lock = threading.Lock()
 
 BOT_VERSION = "1.0 бета"
+
+# Анкета на VPS: uid -> {"step", "purpose", "rules", "exp", "cid", "mid", ...}
+_apps = {}
+
+EXP_LABELS = {
+    "new": "🌱 Новичок",
+    "mid": "⚙️ Средний уровень",
+    "pro": "🚀 Опытный",
+}
+
+
+def _esc(s):
+    """Экранируем текст юзера — иначе '<' в ответе ломает HTML-разметку."""
+    return html.escape(str(s or ""), quote=False)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Bot instance
@@ -185,6 +200,44 @@ def kb_os():
     m.add(types.InlineKeyboardButton("🔙 Назад",            callback_data="back_main"))
     return m
 
+# ── Анкета / модерация ────────────────────────────────────────
+
+def kb_app_cancel():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("❌ Отменить заявку", callback_data="app_cancel"))
+    return m
+
+def kb_app_rules():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("✅ Да, обязуюсь соблюдать", callback_data="app_rules_yes"))
+    m.add(types.InlineKeyboardButton("📜 Сначала прочитать правила", callback_data="rules"))
+    m.add(types.InlineKeyboardButton("❌ Отменить заявку", callback_data="app_cancel"))
+    return m
+
+def kb_app_exp():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("🌱 Новичок — только учусь", callback_data="app_exp_new"))
+    m.add(types.InlineKeyboardButton("⚙️ Средний — база есть", callback_data="app_exp_mid"))
+    m.add(types.InlineKeyboardButton("🚀 Опытный — уверенно работаю", callback_data="app_exp_pro"))
+    m.add(types.InlineKeyboardButton("❌ Отменить заявку", callback_data="app_cancel"))
+    return m
+
+def kb_app_confirm():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(types.InlineKeyboardButton("📨 Отправить заявку", callback_data="app_send"))
+    m.add(types.InlineKeyboardButton("✏️ Заполнить заново", callback_data="app_restart"))
+    m.add(types.InlineKeyboardButton("❌ Отменить", callback_data="app_cancel"))
+    return m
+
+def kb_admin_app(app_id):
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        types.InlineKeyboardButton("✅ Принять",   callback_data=f"adm_app_ok_{app_id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"adm_app_no_{app_id}"),
+    )
+    m.add(types.InlineKeyboardButton("📨 К списку заявок", callback_data="adm_apps"))
+    return m
+
 def kb_vps_list(rows):
     m = types.InlineKeyboardMarkup(row_width=1)
     for row in rows:
@@ -269,6 +322,10 @@ def kb_admin():
         types.InlineKeyboardButton("🚫 Забанить",       callback_data="adm_ban"),
     )
     m.add(types.InlineKeyboardButton("✅ Разбанить",   callback_data="adm_unban"))
+    pending = db.count_pending_applications()
+    m.add(types.InlineKeyboardButton(
+        f"📨 Заявки ({pending})" if pending else "📨 Заявки",
+        callback_data="adm_apps"))
     m.add(types.InlineKeyboardButton("🔙 Назад",       callback_data="back_main"))
     return m
 
@@ -316,7 +373,9 @@ def cmd_deploy(msg):
     if not _check(msg):
         return
     _pending.pop(msg.from_user.id, None)   # сбрасываем висячий ввод админки
-    _do_deploy_msg(msg.chat.id, msg.from_user.id)
+    _apps.pop(msg.from_user.id, None)
+    _do_deploy_msg(msg.chat.id, msg.from_user.id,
+                   msg.from_user.username, msg.from_user.first_name)
 
 @bot.message_handler(func=lambda m: m.text and m.text.strip().lower().startswith("!manage"))
 def cmd_manage_cmd(msg):
@@ -381,6 +440,9 @@ def handle_admin_input(msg):
         except ValueError:
             bot.send_message(msg.chat.id, "❌ Неверное число.", reply_markup=kb_admin())
 
+    elif action == "reject_app":
+        _reject_application(msg.chat.id, task["data"], text)
+
     elif action == "give_vps":
         try:
             target = int(text)
@@ -419,6 +481,248 @@ def handle_admin_input(msg):
                 print(f"[notify] {e}")
         else:
             bot.send_message(msg.chat.id, "❌ Ошибка создания контейнера.", reply_markup=kb_admin())
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Анкета на VPS + модерация заявок
+# ═══════════════════════════════════════════════════════════════════════════
+
+APP_Q1 = (
+    "📝 <b>Заявка на бесплатный VPS</b>\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Отлично! Чтобы вы смогли получить сервер, ответьте на 3 коротких вопроса — "
+    "заявку рассмотрит администратор.\n\n"
+    "<b>Вопрос 1 из 3</b>  ▰▱▱\n"
+    "🎯 <b>Для чего вам VPS?</b>\n\n"
+    "<i>Напишите ответ обычным сообщением. Например: «хостинг Telegram-бота», "
+    "«учусь работать с Linux», «небольшой сайт».</i>"
+)
+
+
+def _app_q2_text(st):
+    return (
+        "📝 <b>Заявка на бесплатный VPS</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ <b>1. Цель:</b> {_esc(st.get('purpose'))}\n\n"
+        "<b>Вопрос 2 из 3</b>  ▰▰▱\n"
+        "📜 <b>Готовы не нарушать правила сервиса?</b>\n\n"
+        "Коротко: вежливое общение с админом и пользователями, 1 VPS в одни руки, "
+        "без майнинга/DDoS и прочего вреда, без 100% CPU круглосуточно.\n\n"
+        "<i>Можно сначала открыть полные правила — анкета не потеряется.</i>"
+    )
+
+
+def _app_q3_text(st):
+    return (
+        "📝 <b>Заявка на бесплатный VPS</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ <b>1. Цель:</b> {_esc(st.get('purpose'))}\n"
+        "✅ <b>2. Правила:</b> обязуюсь соблюдать\n\n"
+        "<b>Вопрос 3 из 3</b>  ▰▰▰\n"
+        "🧑‍💻 <b>Ваш опыт работы с Linux и SSH?</b>\n\n"
+        "<i>Это не экзамен: новичкам мы подскажем базовые команды, "
+        "а опытным сразу выдадим доступ.</i>"
+    )
+
+
+def _app_confirm_text(st):
+    return (
+        "📋 <b>Проверьте заявку</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 <b>Цель:</b> {_esc(st.get('purpose'))}\n"
+        "📜 <b>Правила:</b> ✅ обязуюсь соблюдать\n"
+        f"🧑‍💻 <b>Опыт:</b> {EXP_LABELS.get(st.get('exp'), '—')}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Всё верно? Нажмите <b>«📨 Отправить заявку»</b> — её увидит администратор."
+    )
+
+
+def _app_expired(cid, mid, uid):
+    _apps.pop(uid, None)
+    _edit(cid, mid,
+          "⌛ <b>Анкета устарела</b>\n\nНачните заново: «🖥️ Получить VPS».",
+          kb_main(uid))
+
+
+def _start_application(cid, mid, uid, username="", first_name=""):
+    used, total = db.count_all_vps(), db.get_total_slots()
+    if used >= total:
+        _edit(cid, mid,
+              f"😔 <b>Свободных слотов нет</b>\n\nЗанято {used}/{total}. "
+              "Загляните позже — слоты освобождаются.", kb_back())
+        return
+    if db.count_vps(uid) >= MAX_VPS_PER_USER:
+        _edit(cid, mid,
+              f"❌ <b>У вас уже есть VPS</b>\n\nЛимит — {MAX_VPS_PER_USER} на пользователя. "
+              "Удалите текущий сервер, чтобы подать новую заявку.", kb_back())
+        return
+    app = db.get_user_pending_application(uid)
+    if app:
+        _edit(cid, mid,
+              f"⏳ <b>Заявка #{app[0]} уже на рассмотрении</b>\n\n"
+              "Администратор скоро её посмотрит — решение придёт в этот чат.\n"
+              "<i>Дублировать заявки не нужно 🙏</i>", kb_back())
+        return
+    _apps[uid] = {"step": "purpose", "purpose": "", "rules": False, "exp": "",
+                  "cid": cid, "mid": mid,
+                  "username": username or "", "first_name": first_name or ""}
+    _edit(cid, mid, APP_Q1, kb_app_cancel())
+
+
+@bot.message_handler(func=lambda m: m.chat.type == "private"
+                     and (_apps.get(m.from_user.id) or {}).get("step") == "purpose"
+                     and bool(m.text) and not m.text.startswith("/"))
+def handle_application_purpose(msg):
+    uid = msg.from_user.id
+    st  = _apps.get(uid)
+    if not st:
+        return
+    text = (msg.text or "").strip()
+    if len(text) < 5:
+        bot.send_message(msg.chat.id,
+                         "✏️ Слишком коротко. Опишите цель чуть подробнее (от 5 символов).")
+        return
+    st["purpose"] = text[:300]
+    st["step"]    = "rules"
+    try:
+        bot.delete_message(msg.chat.id, msg.message_id)   # чистим чат
+    except Exception:
+        pass
+    _edit(st["cid"], st["mid"], _app_q2_text(st), kb_app_rules())
+
+
+def _admin_app_text(app):
+    aid, auid, uname, fname, purpose, rules_ok, exp, status, reason, created = app[:10]
+    who = f"@{uname}" if uname else "—"
+    st_map = {"pending": "⏳ На рассмотрении",
+              "approved": "✅ Принята",
+              "rejected": "❌ Отклонена"}
+    txt = (
+        f"📨 <b>Заявка #{aid}</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 <b>Пользователь</b>\n"
+        f"├ 📛 Имя: {_esc(fname) or '—'}\n"
+        f"├ 🔖 Username: {_esc(who)}\n"
+        f"└ 🆔 ID: <code>{auid}</code>\n\n"
+        "📋 <b>Ответы на вопросы</b>\n"
+        f"├ 🎯 Цель: {_esc(purpose)}\n"
+        f"├ 📜 Правила: {'✅ обязуется соблюдать' if rules_ok else '❌ не подтвердил'}\n"
+        f"└ 🧑‍💻 Опыт: {_esc(exp) or '—'}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🖥️ VPS у юзера сейчас: <b>{db.count_vps(auid)}</b>\n"
+        f"📦 Слоты: <b>{db.count_all_vps()}/{db.get_total_slots()}</b>\n"
+        f"📅 Подана: {str(created or '')[:16]}\n"
+        f"📡 Статус: {st_map.get(status, status)}"
+    )
+    if reason:
+        txt += f"\n💬 Причина отказа: {_esc(reason)}"
+    return txt
+
+
+def _send_application(cid, mid, uid, st):
+    app_id = db.add_application(uid, st.get("username"), st.get("first_name"),
+                                st.get("purpose"), st.get("rules"),
+                                EXP_LABELS.get(st.get("exp"), "—"))
+    _apps.pop(uid, None)
+    _edit(cid, mid,
+          "✅ <b>Отлично, заявка отправлена!</b>\n\n"
+          "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+          f"🆔 Номер заявки: <code>#{app_id}</code>\n"
+          "⏳ <b>Ожидайте</b> — администратор рассмотрит её в ближайшее время.\n\n"
+          "📬 Решение придёт сюда, в этот чат.\n"
+          "Если заявку одобрят — VPS создастся автоматически и вы сразу получите "
+          "карточку сервера с доступом.\n\n"
+          "<i>Спасибо за терпение! 🙏</i>",
+          kb_back())
+    try:
+        bot.send_message(ADMIN_ID,
+                         "🔔 <b>Новая заявка на VPS</b>\n\n"
+                         + _admin_app_text(db.get_application(app_id)),
+                         reply_markup=kb_admin_app(app_id))
+    except Exception as e:
+        print(f"[notify admin] {e}")
+
+
+def _approve_application(cid, mid, app_id):
+    app = db.get_application(app_id)
+    if not app:
+        _edit(cid, mid, "❌ Заявка не найдена.", kb_admin())
+        return
+    if app[7] != "pending":
+        _edit(cid, mid, f"ℹ️ Заявка #{app_id} уже обработана.", kb_back("adm_apps"))
+        return
+
+    target = app[1]
+    _edit(cid, mid, f"⚙️ <b>Создаём VPS по заявке #{app_id}...</b>")
+
+    with _deploy_lock:
+        if db.count_all_vps() >= db.get_total_slots():
+            _edit(cid, mid,
+                  "😔 <b>Слоты заняты</b>\n\nУвеличьте число слотов в админке и повторите.",
+                  kb_admin_app(app_id))
+            return
+        if db.count_vps(target) >= MAX_VPS_PER_USER:
+            _edit(cid, mid,
+                  f"⚠️ У пользователя <code>{target}</code> уже есть VPS "
+                  f"(лимит {MAX_VPS_PER_USER}).",
+                  kb_admin_app(app_id))
+            return
+        name = f"vps-{target}-{int(time.time())}"
+        c = dm.create_container(target, name)
+        if not c:
+            _edit(cid, mid,
+                  "❌ <b>Не удалось создать контейнер</b>\n\nПроверьте Docker и повторите.",
+                  kb_admin_app(app_id))
+            return
+        db.upsert_user(target, app[2] or "", app[3] or "")
+        vps_id = db.add_vps(target, c.id, name)
+        db.set_application_status(app_id, "approved")
+
+    # выдаём сервер пользователю сразу же
+    try:
+        bot.send_message(target,
+                         f"🎉 <b>Заявка #{app_id} одобрена!</b>\n\n"
+                         "Ваш бесплатный VPS уже создан и запущен. Приятной работы!\n"
+                         "<i>Напоминаем про правила — они в профиле 📜</i>")
+        vps = db.get_vps(vps_id)
+        bot.send_message(target, _vps_card(vps, dm.get_stats(c.id)),
+                         reply_markup=kb_vps_ctrl(vps_id, "running"))
+    except Exception as e:
+        print(f"[notify user] {e}")
+
+    _edit(cid, mid,
+          f"✅ <b>Заявка #{app_id} принята</b>\n\n"
+          f"VPS <b>{name}</b> выдан пользователю <code>{target}</code> — "
+          "уведомление отправлено.",
+          kb_back("adm_apps"))
+
+
+def _reject_application(admin_chat, app_id, reason_text):
+    app = db.get_application(app_id)
+    if not app:
+        bot.send_message(admin_chat, "❌ Заявка не найдена.", reply_markup=kb_admin())
+        return
+    if app[7] != "pending":
+        bot.send_message(admin_chat, f"ℹ️ Заявка #{app_id} уже обработана.",
+                         reply_markup=kb_admin())
+        return
+    raw = (reason_text or "").strip()
+    reason = "" if raw in ("-", "—", "") else raw[:300]
+    db.set_application_status(app_id, "rejected", reason)
+    target = app[1]
+    try:
+        bot.send_message(target,
+                         f"❌ <b>Заявка #{app_id} отклонена</b>\n\n"
+                         + (f"💬 <b>Причина:</b> {_esc(reason)}\n\n" if reason else "")
+                         + "VPS в этот раз не выдан. Можно подать новую заявку: "
+                           "опишите цель подробнее и подтвердите готовность соблюдать правила.\n\n"
+                           "<i>Спасибо за понимание! 🙏</i>")
+    except Exception as e:
+        print(f"[notify user] {e}")
+    bot.send_message(admin_chat,
+                     f"❌ Заявка #{app_id} отклонена"
+                     + (f" (причина: {_esc(reason)})" if reason else " без причины")
+                     + ". VPS не выдан.",
+                     reply_markup=kb_admin())
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Callbacks
@@ -558,7 +862,7 @@ def _on_callback(call):
               "небольшая нагрузка сервиса: просадки скорости, задержки при "
               "создании VPS или короткие тех. работы.\n\n"
               "🛠️ Мы всё понимаем и постоянно работаем над стабильностью — "
-              "будем стараться всё починить и ускорить.\n\n"
+              "будем стараться всё почи��ить и ускорить.\n\n"
               "<i>Спасибо за понимание и терпение! 🙏</i>",
               kb_faq_back())
 
@@ -586,11 +890,61 @@ def _on_callback(call):
               "🚫 Нарушение любого пункта — удаление VPS или бан без возврата слота.\n"
               "💬 Вопрос или спорная ситуация? Напишите админу спокойно и по делу — "
               "таким обращениям помогаем в первую очередь.",
-              kb_rules_back())
+              # если правила открыты из анкеты — возвращаем к вопросу 2
+              kb_app_rules() if (_apps.get(uid) or {}).get("step") == "rules"
+              else kb_rules_back())
 
     # ── Deploy ─────────────────────────────────────────────────────────────
     elif data.startswith("deploy_"):
-        _deploy_cb(cid, mid, uid)
+        if _is_admin(uid):
+            _deploy_cb(cid, mid, uid)          # админ получает VPS без модерации
+        else:
+            _start_application(cid, mid, uid,
+                               call.from_user.username, call.from_user.first_name)
+
+    # ── Анкета на VPS ───────────────────────────────────────────
+    elif data == "app_cancel":
+        _apps.pop(uid, None)
+        _edit(cid, mid,
+              "❌ <b>Заявка отменена</b>\n\nМожете подать её заново в любой момент.",
+              kb_main(uid))
+
+    elif data == "app_restart":
+        st = _apps.get(uid)
+        if not st:
+            _start_application(cid, mid, uid,
+                               call.from_user.username, call.from_user.first_name)
+        else:
+            st.update({"step": "purpose", "purpose": "", "rules": False, "exp": "",
+                       "cid": cid, "mid": mid})
+            _edit(cid, mid, APP_Q1, kb_app_cancel())
+
+    elif data == "app_rules_yes":
+        st = _apps.get(uid)
+        if not st:
+            _app_expired(cid, mid, uid)
+        else:
+            st["rules"] = True
+            st["step"] = "exp"
+            st["cid"], st["mid"] = cid, mid
+            _edit(cid, mid, _app_q3_text(st), kb_app_exp())
+
+    elif data.startswith("app_exp_"):
+        st = _apps.get(uid)
+        if not st:
+            _app_expired(cid, mid, uid)
+        else:
+            st["exp"] = data.rsplit("_", 1)[1]
+            st["step"] = "confirm"
+            st["cid"], st["mid"] = cid, mid
+            _edit(cid, mid, _app_confirm_text(st), kb_app_confirm())
+
+    elif data == "app_send":
+        st = _apps.get(uid)
+        if not st or st.get("step") != "confirm":
+            _app_expired(cid, mid, uid)
+        else:
+            _send_application(cid, mid, uid, st)
 
     # ── VPS panel ──────────────────────────────────────────────────────────
     elif data.startswith("vps_"):
@@ -647,6 +1001,7 @@ def _show_admin(cid, mid):
           f"👥 Пользователей: <b>{users}</b>\n"
           f"🖥️ VPS занято:    <b>{used}/{total}</b>\n"
           f"🚫 Забанено:      <b>{banned}</b>\n"
+          f"📨 Заявок ждёт:   <b>{db.count_pending_applications()}</b>\n"
           f"🔧 Тех. работы:   {maint}\n\n"
           "━━━━━━━━━━━━━━━━━━━━━━",
           kb_admin())
@@ -735,6 +1090,43 @@ def _handle_admin_cb(uid, cid, mid, data):
         db.unban_user(target)
         _edit(cid, mid, f"✅ Пользователь <code>{target}</code> разбанен.", kb_admin())
 
+    elif data == "adm_apps":
+        apps = db.get_pending_applications()
+        if not apps:
+            _edit(cid, mid,
+                  "📭 <b>Новых заявок нет</b>\n\nВсе заявки обработаны.", kb_admin())
+            return
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for a in apps[:10]:
+            who = f"@{a[2]}" if a[2] else (a[3] or str(a[1]))
+            m.add(types.InlineKeyboardButton(
+                f"#{a[0]} • {who} • {(a[4] or '')[:25]}",
+                callback_data=f"adm_app_{a[0]}"))
+        m.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin"))
+        _edit(cid, mid,
+              f"📨 <b>Заявки на модерации: {len(apps)}</b>\n\n"
+              "Выберите заявку, чтобы принять или отклонить её:", m)
+
+    elif data.startswith("adm_app_ok_"):
+        _approve_application(cid, mid, int(data.rsplit("_", 1)[1]))
+
+    elif data.startswith("adm_app_no_"):
+        app_id = int(data.rsplit("_", 1)[1])
+        _pending[uid] = {"action": "reject_app", "data": app_id}
+        _edit(cid, mid,
+              f"❌ <b>Отклонение заявки #{app_id}</b>\n\n"
+              "Напишите причину отказа сообщением — её увидит пользователь.\n"
+              "Отправьте <code>-</code>, чтобы отклонить без причины.",
+              kb_back("adm_apps"))
+
+    elif data.startswith("adm_app_"):
+        app = db.get_application(int(data.rsplit("_", 1)[1]))
+        if not app:
+            _edit(cid, mid, "❌ Заявка не найдена.", kb_admin())
+            return
+        _edit(cid, mid, _admin_app_text(app),
+              kb_admin_app(app[0]) if app[7] == "pending" else kb_back("adm_apps"))
+
     elif data == "adm_give_vps":
         _pending[uid] = {"action": "give_vps", "data": None}
         _edit(cid, mid,
@@ -755,13 +1147,16 @@ def _show_profile(call):
     uname = f"@{call.from_user.username}" if call.from_user.username else "—"
     reg = str(user[3])[:10] if user and len(user) > 3 and user[3] else "сегодня"
     limit = "∞" if _is_admin(uid) else str(MAX_VPS_PER_USER)
+    app = db.get_user_pending_application(uid)
+    app_line = f"├ 📨 Заявка:   <b>#{app[0]} — на рассмотрении</b>\n" if app else ""
     _edit(call.message.chat.id, call.message.message_id,
-          f"👤 <b>Профиль</b>\n\n"
+          f"👤 <b>Про��иль</b>\n\n"
           "━━━━━━━━━━━━━━━━━━━━━━\n\n"
           f"├ 📛 Имя:      <b>{call.from_user.first_name}</b>\n"
           f"├ 🔖 Username: {uname}\n"
           f"├ 🆔 ID:       <code>{uid}</code>\n"
           f"├ 🖥️ Серверов: <b>{n}</b> / {limit}\n"
+          f"{app_line}"
           f"├ 📅 С нами:   {reg}\n"
           f"└ 🤖 Версия бота: <b>{BOT_VERSION}</b>\n\n"
           "━━━━━━━━━━━━━━━━━━━━━━",
@@ -855,7 +1250,12 @@ def _deploy_cb(cid, mid, uid):
     _edit(cid, mid, DEPLOY_ANIM[0])
     threading.Thread(target=_deploy_worker, args=(cid, mid, uid), daemon=True).start()
 
-def _do_deploy_msg(chat_id, uid):
+def _do_deploy_msg(chat_id, uid, username="", first_name=""):
+    # обычные пользователи проходят модерацию, админ получает VPS сразу
+    if not _is_admin(uid):
+        m = bot.send_message(chat_id, "📝 <b>Готовим анкету на VPS...</b>")
+        _start_application(chat_id, m.message_id, uid, username, first_name)
+        return
     used  = db.count_all_vps()
     total = db.get_total_slots()
     if used >= total:
@@ -940,7 +1340,7 @@ def _do_tmate(cid, mid, uid, vps_id):
         else:
             text = (
                 "❌ <b>TMATE не запустился</b>\n\n"
-                "Убедитесь что VPS запущен.\n"
+                "Убе��итесь что VPS запущен.\n"
                 "Подождите 30 сек после старта и повторите."
             )
         _edit(cid, mid, text, kb)

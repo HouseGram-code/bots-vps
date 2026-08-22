@@ -58,6 +58,25 @@ def init_db():
         )
     """)
 
+    # Заявки на VPS (модерация)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id    INTEGER,
+            username   TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            purpose    TEXT DEFAULT '',
+            rules_ok   INTEGER DEFAULT 0,
+            experience TEXT DEFAULT '',
+            status     TEXT DEFAULT 'pending',
+            reason     TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            decided_at TIMESTAMP
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_app_status ON applications(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_app_user   ON applications(user_id)")
+
     # Default settings
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', '0')")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('total_slots', ?)",
@@ -206,3 +225,60 @@ def get_total_slots():
 
 def set_total_slots(n):
     set_setting("total_slots", str(n))
+
+# ── Applications (модерация заявок) ──────────────────────────────────
+# Колонки: 0 id | 1 user_id | 2 username | 3 first_name | 4 purpose |
+#          5 rules_ok | 6 experience | 7 status | 8 reason | 9 created_at | 10 decided_at
+
+def add_application(user_id, username, first_name, purpose, rules_ok, experience):
+    con = _conn()
+    cur = con.execute(
+        """INSERT INTO applications
+           (user_id, username, first_name, purpose, rules_ok, experience, status)
+           VALUES (?,?,?,?,?,?,'pending')""",
+        (user_id, username or "", first_name or "", purpose or "",
+         1 if rules_ok else 0, experience or "")
+    )
+    aid = cur.lastrowid
+    con.commit()
+    con.close()
+    return aid
+
+def get_application(app_id):
+    con = _conn()
+    row = con.execute("SELECT * FROM applications WHERE id=?", (app_id,)).fetchone()
+    con.close()
+    return row
+
+def get_pending_applications(limit=20):
+    con = _conn()
+    rows = con.execute(
+        "SELECT * FROM applications WHERE status='pending' ORDER BY created_at ASC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    con.close()
+    return rows
+
+def count_pending_applications():
+    con = _conn()
+    n = con.execute("SELECT COUNT(*) FROM applications WHERE status='pending'").fetchone()[0]
+    con.close()
+    return n
+
+def get_user_pending_application(user_id):
+    con = _conn()
+    row = con.execute(
+        "SELECT * FROM applications WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
+    con.close()
+    return row
+
+def set_application_status(app_id, status, reason=""):
+    con = _conn()
+    con.execute(
+        "UPDATE applications SET status=?, reason=?, decided_at=CURRENT_TIMESTAMP WHERE id=?",
+        (status, reason or "", app_id)
+    )
+    con.commit()
+    con.close()
