@@ -26,13 +26,13 @@ _deploy_lock = threading.Lock()
 
 BOT_VERSION = "1.0 бета"
 
-# Анкета на VPS: uid -> {"step", "purpose", "rules", "exp", "cid", "mid", ...}
+# Анкета на VPS: uid -> {"step", "purpose", "rules", "plan", "cid", "mid", ...}
 _apps = {}
 
-EXP_LABELS = {
-    "new": "🌱 Новичок",
-    "mid": "⚙️ Средний уровень",
-    "pro": "🚀 Опытный",
+PLAN_LABELS = {
+    "test":   "🕐 Пара дней — попробовать",
+    "weeks":  "📅 Несколько недель — под проект",
+    "always": "♾️ Постоянно — бот/сайт 24/7",
 }
 
 
@@ -214,11 +214,11 @@ def kb_app_rules():
     m.add(types.InlineKeyboardButton("❌ Отменить заявку", callback_data="app_cancel"))
     return m
 
-def kb_app_exp():
+def kb_app_plan():
     m = types.InlineKeyboardMarkup(row_width=1)
-    m.add(types.InlineKeyboardButton("🌱 Новичок — только учусь", callback_data="app_exp_new"))
-    m.add(types.InlineKeyboardButton("⚙️ Средний — база есть", callback_data="app_exp_mid"))
-    m.add(types.InlineKeyboardButton("🚀 Опытный — уверенно работаю", callback_data="app_exp_pro"))
+    m.add(types.InlineKeyboardButton("🕐 Пара дней — просто попробовать", callback_data="app_plan_test"))
+    m.add(types.InlineKeyboardButton("📅 Несколько недель — под проект", callback_data="app_plan_weeks"))
+    m.add(types.InlineKeyboardButton("♾️ Постоянно — бот или сайт 24/7", callback_data="app_plan_always"))
     m.add(types.InlineKeyboardButton("❌ Отменить заявку", callback_data="app_cancel"))
     return m
 
@@ -322,6 +322,7 @@ def kb_admin():
         types.InlineKeyboardButton("🚫 Забанить",       callback_data="adm_ban"),
     )
     m.add(types.InlineKeyboardButton("✅ Разбанить",   callback_data="adm_unban"))
+    m.add(types.InlineKeyboardButton("📣 Рассылка",    callback_data="adm_bcast"))
     pending = db.count_pending_applications()
     m.add(types.InlineKeyboardButton(
         f"📨 Заявки ({pending})" if pending else "📨 Заявки",
@@ -440,6 +441,26 @@ def handle_admin_input(msg):
         except ValueError:
             bot.send_message(msg.chat.id, "❌ Неверное число.", reply_markup=kb_admin())
 
+    elif action == "bcast":
+        body = getattr(msg, "html_text", None) or text
+        _pending[uid] = {"action": "bcast_ready", "data": body}
+        m = types.InlineKeyboardMarkup(row_width=1)
+        m.add(types.InlineKeyboardButton(f"📣 Отправить всем ({db.count_all_users()})",
+                                         callback_data="adm_bcast_go"))
+        m.add(types.InlineKeyboardButton("❌ Отмена", callback_data="adm_bcast_no"))
+        try:
+            bot.send_message(msg.chat.id, "👀 <b>Предпросмотр рассылки:</b>")
+            bot.send_message(msg.chat.id, body)
+            bot.send_message(msg.chat.id,
+                             "Отправляем это сообщение всем пользователям?",
+                             reply_markup=m)
+        except Exception as e:
+            _pending.pop(uid, None)
+            bot.send_message(msg.chat.id,
+                             f"❌ Не получилось показать предпросмотр: {e}\n\n"
+                             "Проверьте разметку и попроб��йте снова.",
+                             reply_markup=kb_admin())
+
     elif action == "reject_app":
         _reject_application(msg.chat.id, task["data"], text)
 
@@ -518,9 +539,10 @@ def _app_q3_text(st):
         f"✅ <b>1. Цель:</b> {_esc(st.get('purpose'))}\n"
         "✅ <b>2. Правила:</b> обязуюсь соблюдать\n\n"
         "<b>Вопрос 3 из 3</b>  ▰▰▰\n"
-        "🧑‍💻 <b>Ваш опыт работы с Linux и SSH?</b>\n\n"
-        "<i>Это не экзамен: новичкам мы подскажем базовые команды, "
-        "а опытным сразу выдадим доступ.</i>"
+        "⏳ <b>На какой срок вам нужен сервер?</b>\n\n"
+        "Отвечайте честно — так мы видим, сколько слотов держать свободными "
+        "и кому продлевать VPS в первую очередь.\n\n"
+        "<i>Любой ответ нормальный: даже «просто попробовать» — повод выдать сервер.</i>"
     )
 
 
@@ -530,7 +552,7 @@ def _app_confirm_text(st):
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎯 <b>Цель:</b> {_esc(st.get('purpose'))}\n"
         "📜 <b>Правила:</b> ✅ обязуюсь соблюдать\n"
-        f"🧑‍💻 <b>Опыт:</b> {EXP_LABELS.get(st.get('exp'), '—')}\n\n"
+        f"⏳ <b>Срок:</b> {PLAN_LABELS.get(st.get('plan'), '—')}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Всё верно? Нажмите <b>«📨 Отправить заявку»</b> — её увидит администратор."
     )
@@ -562,7 +584,7 @@ def _start_application(cid, mid, uid, username="", first_name=""):
               "Администратор скоро её посмотрит — решение придёт в этот чат.\n"
               "<i>Дублировать заявки не нужно 🙏</i>", kb_back())
         return
-    _apps[uid] = {"step": "purpose", "purpose": "", "rules": False, "exp": "",
+    _apps[uid] = {"step": "purpose", "purpose": "", "rules": False, "plan": "",
                   "cid": cid, "mid": mid,
                   "username": username or "", "first_name": first_name or ""}
     _edit(cid, mid, APP_Q1, kb_app_cancel())
@@ -606,7 +628,7 @@ def _admin_app_text(app):
         "📋 <b>Ответы на вопросы</b>\n"
         f"├ 🎯 Цель: {_esc(purpose)}\n"
         f"├ 📜 Правила: {'✅ обязуется соблюдать' if rules_ok else '❌ не подтвердил'}\n"
-        f"└ 🧑‍💻 Опыт: {_esc(exp) or '—'}\n\n"
+        f"└ ⏳ Срок: {_esc(exp) or '—'}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🖥️ VPS у юзера сейчас: <b>{db.count_vps(auid)}</b>\n"
         f"📦 Слоты: <b>{db.count_all_vps()}/{db.get_total_slots()}</b>\n"
@@ -621,7 +643,7 @@ def _admin_app_text(app):
 def _send_application(cid, mid, uid, st):
     app_id = db.add_application(uid, st.get("username"), st.get("first_name"),
                                 st.get("purpose"), st.get("rules"),
-                                EXP_LABELS.get(st.get("exp"), "—"))
+                                PLAN_LABELS.get(st.get("plan"), "—"))
     _apps.pop(uid, None)
     _edit(cid, mid,
           "✅ <b>Отлично, заявка отправлена!</b>\n\n"
@@ -723,6 +745,40 @@ def _reject_application(admin_chat, app_id, reason_text):
                      + (f" (причина: {_esc(reason)})" if reason else " без причины")
                      + ". VPS не выдан.",
                      reply_markup=kb_admin())
+
+
+def _broadcast_worker(cid, mid, body):
+    """Рассылка в фоне: не блокирует бота и держится в лимитах Telegram."""
+    users = db.get_all_users()
+    total = len(users)
+    ok = fail = 0
+    for i, u in enumerate(users, 1):
+        target = u[0]
+        try:
+            if db.is_banned(target):
+                continue
+            bot.send_message(target, body)
+            ok += 1
+        except Exception:
+            fail += 1                      # чаще всего — юзер заблокировал бота
+        time.sleep(0.06)                   # лимит Telegram �� ~30 сообщений/сек
+        if i % 25 == 0:
+            try:
+                _edit(cid, mid,
+                      "📣 <b>Рассылка идёт...</b>\n\n"
+                      f"✅ Доставлено: <b>{ok}</b>\n"
+                      f"❌ Ошибок: <b>{fail}</b>\n"
+                      f"📊 Обработано: <b>{i}/{total}</b>")
+            except Exception:
+                pass
+    _edit(cid, mid,
+          "📣 <b>Рассылка завершена</b>\n\n"
+          "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+          f"✅ Доставлено: <b>{ok}</b>\n"
+          f"❌ Не доставлено: <b>{fail}</b>\n"
+          f"👥 Всего в базе: <b>{total}</b>\n\n"
+          "<i>Не доставлено — те, кто заблокировал бота или удалил чат.</i>",
+          kb_admin())
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Callbacks
@@ -915,7 +971,7 @@ def _on_callback(call):
             _start_application(cid, mid, uid,
                                call.from_user.username, call.from_user.first_name)
         else:
-            st.update({"step": "purpose", "purpose": "", "rules": False, "exp": "",
+            st.update({"step": "purpose", "purpose": "", "rules": False, "plan": "",
                        "cid": cid, "mid": mid})
             _edit(cid, mid, APP_Q1, kb_app_cancel())
 
@@ -925,16 +981,16 @@ def _on_callback(call):
             _app_expired(cid, mid, uid)
         else:
             st["rules"] = True
-            st["step"] = "exp"
+            st["step"] = "plan"
             st["cid"], st["mid"] = cid, mid
-            _edit(cid, mid, _app_q3_text(st), kb_app_exp())
+            _edit(cid, mid, _app_q3_text(st), kb_app_plan())
 
-    elif data.startswith("app_exp_"):
+    elif data.startswith("app_plan_"):
         st = _apps.get(uid)
         if not st:
             _app_expired(cid, mid, uid)
         else:
-            st["exp"] = data.rsplit("_", 1)[1]
+            st["plan"] = data.rsplit("_", 1)[1]
             st["step"] = "confirm"
             st["cid"], st["mid"] = cid, mid
             _edit(cid, mid, _app_confirm_text(st), kb_app_confirm())
@@ -1090,6 +1146,31 @@ def _handle_admin_cb(uid, cid, mid, data):
         db.unban_user(target)
         _edit(cid, mid, f"✅ Пользователь <code>{target}</code> разбанен.", kb_admin())
 
+    elif data == "adm_bcast":
+        _pending[uid] = {"action": "bcast", "data": None}
+        _edit(cid, mid,
+              "📣 <b>Рассылка всем пользователям</b>\n\n"
+              "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+              f"👥 Получателей в базе: <b>{db.count_all_users()}</b>\n\n"
+              "Отправьте текст рассылки одним сообщением — можно с эмодзи "
+              "и обычным форматированием Telegram.\n"
+              "Перед отправкой покажу предпросмотр.",
+              kb_back("admin"))
+
+    elif data == "adm_bcast_go":
+        task = _pending.pop(uid, None)
+        body = (task or {}).get("data")
+        if not body:
+            _edit(cid, mid, "⌛ Текст рассылки потерялся. Начните заново.", kb_admin())
+            return
+        _edit(cid, mid, "📣 <b>Рассылка запущена...</b>")
+        threading.Thread(target=_broadcast_worker, args=(cid, mid, body),
+                         daemon=True).start()
+
+    elif data == "adm_bcast_no":
+        _pending.pop(uid, None)
+        _edit(cid, mid, "❌ Рассылка отменена.", kb_admin())
+
     elif data == "adm_apps":
         apps = db.get_pending_applications()
         if not apps:
@@ -1138,7 +1219,7 @@ def _handle_admin_cb(uid, cid, mid, data):
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Feature handlers
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════��══════════════════════════════════════════════════════════════════
 
 def _show_profile(call):
     uid = call.from_user.id
